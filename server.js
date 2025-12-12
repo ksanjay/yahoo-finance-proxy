@@ -141,8 +141,6 @@ app.get("/yahoo/options/:symbol", async (req, res) => {
 
 app.use((req, res) => res.status(404).json({ error: "Not found", path: req.path }));
 
-app.listen(PORT, () => console.log(`Yahoo proxy listening on ${PORT}`));
-
 app.listen(PORT, () => {
   console.log(`Yahoo proxy listening on ${PORT}`);
 });
