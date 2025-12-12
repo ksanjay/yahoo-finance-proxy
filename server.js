@@ -6,8 +6,8 @@ const PORT = process.env.PORT || 10000;
 
 /**
  * CORS:
- * - Set ALLOWED_ORIGINS="*" to allow all
- * - Or set ALLOWED_ORIGINS="https://your-static-site.onrender.com,https://yourdomain.com"
+ * - ALLOWED_ORIGINS="*" (default)
+ * - or "https://your-static-site.onrender.com,https://yourdomain.com"
  */
 function corsMiddleware(req, res, next) {
   const origin = req.headers.origin || "";
@@ -26,7 +26,6 @@ function corsMiddleware(req, res, next) {
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
-
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 }
@@ -36,37 +35,52 @@ app.use(corsMiddleware);
 app.disable("x-powered-by");
 
 /**
- * Tiny in-memory cache (per Render instance)
- * Default: 30 seconds
- * Set CACHE_TTL_MS=60000 for 60s if you still see throttling
+ * Cache controls
+ * CACHE_TTL_MS: fresh cache TTL
+ * STALE_TTL_MS: how long we will serve stale cache on upstream errors (429/5xx)
  */
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 30_000);
-const cache = new Map(); // key -> { expiresAt, status, headers, bodyText }
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 120_000); // default 2 minutes
+const STALE_TTL_MS = Number(process.env.STALE_TTL_MS || 900_000); // default 15 minutes
+
+/**
+ * Cache entry:
+ * - expiresAt: fresh until this time
+ * - staleUntil: can be served on errors until this time
+ */
+const cache = new Map(); // key -> { expiresAt, staleUntil, status, headers, bodyText, storedAt }
+const inflight = new Map(); // key -> Promise (request coalescing)
 
 function cacheGet(key) {
   const v = cache.get(key);
   if (!v) return null;
-  if (Date.now() > v.expiresAt) {
-    cache.delete(key);
-    return null;
-  }
   return v;
 }
 
 function cacheSet(key, status, headersObj, bodyText) {
+  const now = Date.now();
   cache.set(key, {
-    expiresAt: Date.now() + CACHE_TTL_MS,
+    storedAt: now,
+    expiresAt: now + CACHE_TTL_MS,
+    staleUntil: now + STALE_TTL_MS,
     status,
     headers: headersObj,
     bodyText,
   });
 }
 
+function isFresh(entry) {
+  return entry && Date.now() <= entry.expiresAt;
+}
+
+function isStaleOk(entry) {
+  return entry && Date.now() <= entry.staleUntil;
+}
+
 /**
- * Fetch with backoff for 429 / 5xx
- * Also sends browser-like headers which helps avoid Yahoo 401s in many environments.
+ * Fetch with limited retry/backoff for 429/5xx.
+ * IMPORTANT: Keep retries low to avoid amplifying rate limits.
  */
-async function fetchWithRetry(url, { tries = 3 } = {}) {
+async function fetchWithRetry(url, { tries = 2 } = {}) {
   let lastErr;
 
   for (let i = 0; i < tries; i++) {
@@ -84,72 +98,112 @@ async function fetchWithRetry(url, { tries = 3 } = {}) {
 
     if (res.ok) return res;
 
-    // Retry on rate-limit or transient upstream errors
+    // Retry only on 429 or 5xx
     if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
       const retryAfter = res.headers.get("retry-after");
       const waitMs = retryAfter
         ? Math.min(10_000, Number(retryAfter) * 1000)
-        : Math.min(10_000, 500 * Math.pow(2, i)); // 0.5s, 1s, 2s...
+        : Math.min(10_000, 500 * Math.pow(2, i)); // 500ms, 1s...
 
       await new Promise((r) => setTimeout(r, waitMs));
       lastErr = new Error(`Upstream ${res.status} for ${url}`);
+      lastErr.status = res.status;
       continue;
     }
 
-    // Non-retryable errors: surface a short snippet
     const text = await res.text().catch(() => "");
-    throw new Error(
+    const err = new Error(
       `Upstream error ${res.status} for ${url}: ${text.slice(0, 200)}`
     );
+    err.status = res.status;
+    throw err;
   }
 
   throw lastErr || new Error("Upstream fetch failed");
 }
 
 /**
- * Cached forward helper
+ * Cached forward with:
+ * - fresh cache return
+ * - request coalescing
+ * - stale-on-error (429/5xx): serve last cached response if available
  */
 async function cachedForward(req, res, upstreamUrl) {
-  const cacheKey = upstreamUrl;
-  const cached = cacheGet(cacheKey);
+  const key = upstreamUrl;
+  const entry = cacheGet(key);
 
-  if (cached) {
+  // 1) If fresh, serve immediately
+  if (isFresh(entry)) {
     res.setHeader("X-Cache", "HIT");
-    res.setHeader(
-      "Cache-Control",
-      `public, max-age=${Math.floor(CACHE_TTL_MS / 1000)}`
-    );
-    res.status(cached.status);
-    res.setHeader(
-      "Content-Type",
-      cached.headers["content-type"] || "application/json"
-    );
-    return res.send(cached.bodyText);
+    res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL_MS / 1000)}`);
+    res.setHeader("Content-Type", entry.headers["content-type"] || "application/json");
+    return res.status(entry.status).send(entry.bodyText);
   }
 
-  try {
-    const upstreamRes = await fetchWithRetry(upstreamUrl, { tries: 3 });
+  // 2) If someone else is already fetching this key, await it (coalescing)
+  if (inflight.has(key)) {
+    try {
+      await inflight.get(key);
+      const after = cacheGet(key);
+      if (after) {
+        res.setHeader("X-Cache", "HIT-AFTER-WAIT");
+        res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL_MS / 1000)}`);
+        res.setHeader("Content-Type", after.headers["content-type"] || "application/json");
+        return res.status(after.status).send(after.bodyText);
+      }
+      // fallthrough if somehow cache not set
+    } catch {
+      // fallthrough to stale-on-error below
+    }
+  }
+
+  // 3) Make upstream request (single flight per key)
+  const p = (async () => {
+    const upstreamRes = await fetchWithRetry(upstreamUrl, { tries: 2 });
     const bodyText = await upstreamRes.text();
 
     const headersObj = {
-      "content-type":
-        upstreamRes.headers.get("content-type") || "application/json",
+      "content-type": upstreamRes.headers.get("content-type") || "application/json",
     };
 
-    cacheSet(cacheKey, upstreamRes.status, headersObj, bodyText);
+    cacheSet(key, upstreamRes.status, headersObj, bodyText);
+  })();
+
+  inflight.set(key, p);
+
+  try {
+    await p;
+    const fresh = cacheGet(key);
 
     res.setHeader("X-Cache", "MISS");
-    res.setHeader(
-      "Cache-Control",
-      `public, max-age=${Math.floor(CACHE_TTL_MS / 1000)}`
-    );
-    res.setHeader("Content-Type", headersObj["content-type"]);
-    return res.status(upstreamRes.status).send(bodyText);
+    res.setHeader("Cache-Control", `public, max-age=${Math.floor(CACHE_TTL_MS / 1000)}`);
+    res.setHeader("Content-Type", fresh?.headers["content-type"] || "application/json");
+    return res.status(fresh?.status || 200).send(fresh?.bodyText || "{}");
   } catch (e) {
+    // 4) Stale-on-error: If upstream failed (especially 429), serve stale cache if allowed
+    const still = cacheGet(key);
+
+    const upstreamStatus = e?.status;
+    const isRateLimitOr5xx =
+      upstreamStatus === 429 || (upstreamStatus >= 500 && upstreamStatus <= 599) || !upstreamStatus;
+
+    if (isRateLimitOr5xx && isStaleOk(still)) {
+      res.setHeader("X-Cache", "STALE");
+      res.setHeader("X-Upstream-Error", String(upstreamStatus || "unknown"));
+      res.setHeader("Cache-Control", `public, max-age=0, stale-while-revalidate=${Math.floor(STALE_TTL_MS / 1000)}`);
+      res.setHeader("Content-Type", still.headers["content-type"] || "application/json");
+      return res.status(still.status).send(still.bodyText);
+    }
+
     console.error("Proxy error:", e);
-    return res
-      .status(502)
-      .json({ error: "Bad gateway", detail: String(e.message || e) });
+    return res.status(502).json({
+      error: "Bad gateway",
+      detail: String(e?.message || e),
+      upstreamStatus: upstreamStatus ?? null,
+      hint: "Yahoo is rate-limiting this server. Increase CACHE_TTL_MS and reduce client request frequency.",
+    });
+  } finally {
+    inflight.delete(key);
   }
 }
 
@@ -161,26 +215,18 @@ app.get("/", (req, res) => {
     ok: true,
     service: "yahoo-finance-proxy",
     cache_ttl_ms: CACHE_TTL_MS,
+    stale_ttl_ms: STALE_TTL_MS,
   });
 });
 
-/**
- * Quote:
- * /yahoo/quote?symbols=AAPL,MSFT
- *
- * Use query2 for better behavior in many environments.
- */
+// Quote: /yahoo/quote?symbols=AAPL,MSFT
 app.get("/yahoo/quote", async (req, res) => {
   const qs = req.originalUrl.split("?")[1] || "";
   const upstream = `https://query2.finance.yahoo.com/v7/finance/quote?${qs}`;
   return cachedForward(req, res, upstream);
 });
 
-/**
- * Options:
- * /yahoo/options/AAPL
- * /yahoo/options/AAPL?date=1734048000
- */
+// Options: /yahoo/options/AAPL or /yahoo/options/AAPL?date=...
 app.get("/yahoo/options/:symbol", async (req, res) => {
   const symbol = encodeURIComponent(req.params.symbol || "");
   const qs = req.originalUrl.includes("?")
