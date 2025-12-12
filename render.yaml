@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: yahoo-finance-proxy
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: "*"
